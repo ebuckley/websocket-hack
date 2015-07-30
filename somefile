@@ -1,0 +1,800 @@
+
+module.exports = function(grunt) {
+	'use strict';
+
+	var os = require('os'),
+		path = require('path'),
+		_ = require('underscore-contrib'),
+		q = require('q');
+
+	var config,
+		probe,
+		env,
+		features,
+		exec_ext,
+		php_report_path,
+		protractor_conf,
+		visionNG,
+		dockerName,
+		bambooPlan,
+		buildVersion,
+		jshintFileList,
+		urlprefix;
+
+	// load config file or die
+	if (!grunt.option('ignore-config-file')) {
+		try {
+			config = _.extend(config, grunt.file.readJSON('config.json'));
+		} catch (e) {
+			if (e.origError.code === 'ENOENT') {
+				grunt.log.error('No config.json file found, continuing with defaults.');
+			} else  {
+				grunt.fail.fatal('Error reading config.json (' + e + ').');
+			}
+		}
+	}
+
+	config = _.extend({
+			features:[],
+			constants:{}
+		}, config);
+
+	
+
+	visionNG = grunt.option('visionNG');
+	probe = grunt.option('probe') || config.probe || '';
+	env = grunt.option('env') || config.env || 'production';
+	features = (grunt.option('features') ? grunt.option('features').split(',') : config.features || []);
+	protractor_conf = grunt.option('protractor-conf') || (__dirname + '/src/app/assets/test/config/protractor.conf.js');
+	php_report_path = grunt.option('log-junit') || '~/php-test-results.xml';
+	exec_ext = (os.platform === 'win32' ? 'bat' : 'sh');
+	dockerName = grunt.option('name') || 'dev-vision-ng';
+	buildVersion = (_.isString(grunt.option('build-version')) ? grunt.option('build-version') : false);
+	urlprefix = grunt.option('urlprefix') || config.constants.URL_PREFIX || "";
+
+
+	if (!config.constants.URL_PREFIX) {
+		config.constants.URL_PREFIX = urlprefix;
+	}
+
+	//create base test reports folder
+	require('mkdirp')('build/test_reports', function (){});
+
+	jshintFileList = [
+		'Gruntfile.js',
+		'src/app/assets/resources/*.json',
+		'src/app/assets/scripts/controllers/**/*.js',
+		'src/app/assets/scripts/directives/**/*.js',
+		'src/app/assets/scripts/filters/**/*.js',
+		'src/app/assets/scripts/services/**/*.js',
+		'src/app/assets/scripts/app.js',
+		'src/app/assets/scripts/services/**/*.js',
+		'src/app/assets/test/e2e/**/*.js',
+		'src/app/assets/test/unit/**/*.js'
+	];
+
+	// Project configuration.
+	grunt.initConfig({
+		pkg: grunt.file.readJSON('package.json'),
+		wait: {
+			default: {
+				options: {
+					delay: 5000
+				}
+			}
+		},
+		jshint: {
+			options: {
+				force: true,
+				jshintrc: path.join(__dirname, '.jshintrc')
+			},
+			all: jshintFileList,
+			junit_reporter: {
+				options: {
+					reporter: require("jshint-junit-reporter"),
+					reporterOutput: "build/test_reports/jshint-test-results.xml"
+				},
+				files: {
+					src: jshintFileList
+				}
+			}
+		},
+		mkdir: {
+			build: {
+				options: {
+					create: [
+						'build',
+						'build/code'
+					]
+				}
+			}
+		},
+		rsync: {
+			build: {
+				src: "src/",
+				dest: "build/code",
+				recursive: true,
+				syncDest: true,
+				exclude: ['*.less'],
+				args: ["-l", "-p", "--chmod=ugo=rX,u+w", "--checksum"]
+			}
+		},
+		sshconfig: {
+			admin: {
+				host: probe,
+				username: "admin",
+				privateKey: grunt.file.read("id_rsa")
+			},
+			root: {
+				host: probe,
+				username: "root",
+				privateKey: grunt.file.read("id_rsa")
+			}
+		},
+		sshexec: {
+			provision_datasources: {
+				command: (function () {
+					//iife returns a list of commands for creating rotfiles
+					var commandString = '/opt/tms/bin/cli -m config -t ';
+					//names of the rotfiles to create
+					var nameOptions = [
+						'Auckland',
+						'Wellington',
+						'Christchurch',
+						'Hamilton',
+						'Napier-Hastings',
+						'Tauranga',
+						'Dunedin',
+						'Palmerston-North',
+						'Nelson',
+						'Rotorua',
+						'Whangarei'
+					];
+					return _.chain(nameOptions)
+						.map(function(item) {
+							return commandString + '"erfstream rotation-file ' + item + ' size-limit 100GB vision enable vision size-limit 100GB"';
+						})
+						.value();
+				})(),
+				options: {
+					config : 'root'
+				}
+			}
+		},
+		shell: {
+			gulp_build: {
+				command: 'gulp build ' + buildCmdArgs(),
+				options: {
+					stdout: true,
+					stderr: true
+				}
+			},
+			docker_build: {
+				command: 'docker build -t ' + dockerName + '-image .',
+				options:{
+					stdout: true,
+					stderr: true
+				}
+			},
+			docker_create_data_if_not_exists: {
+				command: 'docker inspect ' + dockerName + '-data > /dev/null 2>&1 || docker run --name ' + dockerName + '-data -v /visionng/database centos:7 true',
+				options:{
+					stdout: true,
+					stderr: true
+				}
+			},
+			docker_run: {
+				command:'docker run --add-host=hostosm:<%=hostosmip%> --add-host=docker0:<%=dockerip%> --name ' + dockerName + ' -d -P -v ' + __dirname + '/build/code:/visionng/dev-code -v ' + __dirname + '/build/test_reports:/visionng/test_reports --volumes-from ' + dockerName + '-data ' + dockerName + '-image',
+				options:{
+					stdout: true,
+					stderr: true
+				}
+			},
+			docker_get_osm_ip: {
+				command:'ip addr show scope global dev eth0 | grep inet | awk \'{print $2}\' | cut -d / -f 1',
+				options:{
+					callback: function(err,stdout,stderr, cb)
+					{
+						grunt.config.set('hostosmip', stdout.replace('\n', ''));
+						if(grunt.config.get('hostosmip') === '')
+						{
+							grunt.config.set('hostosmip','0.0.0.0');
+						}
+						grunt.log.ok('Host IP: ' + grunt.config.get('hostosmip'));
+						cb();
+					}
+				}
+			},
+			docker_get_docker_ip: {
+				command:'ip addr show scope global dev docker0 | grep inet | awk \'{print $2}\' | cut -d / -f 1',
+				options:{
+					callback: function(err,stdout,stderr, cb)
+					{
+						grunt.config.set('dockerip', stdout.replace('\n', ''));
+						grunt.log.ok('Docker0 IP: ' + grunt.config.get('dockerip'));
+						cb();
+					}
+				}
+			},
+			docker_stop: {
+				command: 'docker stop ' + dockerName,
+				options:{
+					stdout: true,
+					stderr: true
+				}
+			},
+			docker_remove: {
+				command: 'docker rmi -f ' + dockerName + '-image',
+				options:{
+					stdout: true,
+					stderr: true
+				}
+			},
+			docker_status: {
+				command: 'docker ps',
+				options:{
+					stdout: true,
+					stderr: true
+				}
+			},
+			docker_logs: {
+				command: 'docker exec ' + dockerName + ' tail -f /var/log/nginx/access.log /var/log/nginx/error.log',
+				options:{
+					stdout: true,
+					stderr: true
+				}
+			},
+			docker_clean: {
+				command: 'docker inspect ' + dockerName + ' > /dev/null 2>&1 && docker rm -f ' + dockerName,
+				options:{
+					stdout: true,
+					stderr: true
+				}
+			},
+			docker_clean_data: {
+				command: 'docker inspect ' + dockerName + '-data > /dev/null 2>&1 && docker rm -f ' + dockerName + '-data',
+				options:{
+					stdout: true,
+					stderr: true
+				}
+			},
+			docker_copy_src: {
+				command: 'docker exec ' + dockerName + ' rsync -a --delete /visionng/dev-code/ /visionng/code',
+				options:{
+					stdout: true,
+					stderr: true
+				}
+			},
+			remove_bower_components: {
+				command: 'rm -rf bower_components'
+			},
+			test_js: {
+				command: path.join('src', 'app', 'assets', 'test', 'batch', 'test.' + exec_ext) + ' ' + buildCmdArgs(),
+				options: {
+					stdout: true,
+					stderr: true
+				}
+			},
+			test_e2e: {
+				command: path.join('src', 'app', 'assets', 'test', 'batch', 'e2e-test.' + exec_ext) + ' ' + protractor_conf + ' '  + buildCmdArgs({ baseUrl: '\'http://' + visionNG + '\' '}),
+				options: {
+					stdout: true,
+					stderr: true
+				}
+			},
+			test_e2e_cleanup: {
+				command: path.join('src', 'app', 'assets', 'test', 'batch', 'e2e-test.' + exec_ext) + ' ' + protractor_conf + ' --specs src/app/assets/test/e2e/spec/cleanup.js '  + buildCmdArgs({ baseUrl: '\'http://' + visionNG + '\' '}, null, null, function (flag) { return !flag.match(/specs/); }),
+				options: {
+					stdout: true,
+					stderr: true
+				}
+			},
+			test_e2e_setup: {
+				command: path.join('src', 'app', 'assets', 'test', 'batch', 'e2e-test.' + exec_ext) + ' ' + protractor_conf + ' --specs src/app/assets/test/e2e/spec/setup.js '  + buildCmdArgs({ baseUrl: '\'http://' + visionNG + '\' '}, null, null, function (flag) { return !flag.match(/specs/); }),
+				options: {
+					stdout: true,
+					stderr: true
+				}
+			},
+			test_php: {
+				command: 'docker exec ' + dockerName + ' bash -c \'cd /visionng/code/app/application/tests && php phpunit.phar ' + buildPhpUnitOptions() + '; chown `stat -c "%u:%g" /visionng/test_reports` /visionng/test_reports/php-test-results.xml\'',
+				options: {
+					stdout: true,
+					stderr: true
+				}
+			},
+			tar_e2e_test_artifacts: {
+				command: 'cd ' + __dirname + '/build/test_reports && tar cfz e2e-test-snapshot.tar.gz e2e_test_results',
+				options: {
+					stdout: true,
+					stderr: true
+				}
+			},
+			tar_js_coverage_artifacts: {
+				command: 'cd ' + __dirname + '/build/test_reports && tar cfz js-coverage-reports.tar.gz coverage_reports',
+				options: {
+					stdout: true,
+					stderr: true
+				}
+			},
+			selenium_standalone: {
+				command: 'webdriver-manager update && webdriver-manager start',
+				options: {
+					stdout: true,
+					stdin: true,
+					stderr: true
+				}
+			},
+			is_dirty: {
+				command: 'git status --porcelain',
+				options: {
+					callback: setDirty
+				}
+			}
+		},
+		ngtemplates: {
+			VISION: {
+				cwd: 'build/code/app',
+				src: 'assets/views/**.html',
+				dest: 'build/code/app/assets/views/template.js',
+				options: {
+					concat: 'endace',
+					prefix: '/vision/'
+				},
+			}
+		},
+		concat: {
+			options: {
+				separator: ';\n'
+			},
+			endace: {
+				src: [
+					'build/code/app/assets/scripts/app.js',
+					'build/code/app/assets/scripts/services/*.js',
+					'build/code/app/assets/scripts/services/charts/*.js',
+					'build/code/app/assets/scripts/directives/*.js',
+					'build/code/app/assets/scripts/controllers/*.js',
+					'build/code/app/assets/scripts/filters/*.js',
+					'build/code/app/assets/vendor/bindonce/bindonce.min.js'
+				],
+				dest: 'build/code/app/assets/scripts/endace.js'
+			},
+			jquery: {
+				src: [
+					'build/code/app/js/jquery-1.8.1.min.js',
+					'build/code/app/js/jquery-ui-1.8.23.custom.min.js',
+					'build/code/app/js/jquery.layout-latest.min.js',
+					'build/code/app/js/jquery.popover.js',
+					'build/code/app/js/jquery.validate.min.js'
+				],
+				dest: 'build/code/app/assets/scripts/jquery-essentials.min.js'
+			},
+			charts: {
+				src: [
+					'build/code/app/js/highcharts.js',
+					'build/code/app/js/hack/*.js',
+					'build/code/app/js/jquery.dataTables.js',
+					'build/code/app/js/d3/*.js'
+				],
+				dest: 'build/code/app/assets/scripts/chart-essentials.js'
+			}
+		},
+		uglify: {
+			endace: {
+				options: {
+					sourceMap: true
+				},
+				files: {
+					'build/code/app/assets/scripts/endace.min.js': [
+						'build/code/app/assets/scripts/endace.js'
+					]
+				}
+			},
+			third_party: {
+				options: {
+					sourceMap: true
+				},
+				files: {
+					'build/code/app/assets/scripts/vendor.min.js': [
+						'build/code/app/assets/scripts/vendor.js'
+					]
+				}
+			},
+			charts: {
+				options: {
+					sourceMap: true
+				},
+				files: {
+					'build/code/app/assets/scripts/chart-essentials.min.js': [
+						'build/code/app/assets/scripts/chart-essentials.js'
+					]
+				}
+			}
+		},
+		"git-rev-parse": {
+			"short": {
+				options: {
+					prop: 'githash'
+				}
+			}
+		},
+		karma: {
+			unit: {
+				options: buildKarmaOptions(),
+			},
+			build: {
+				options: {
+					configFile: 'src/app/assets/test/config/karma-build.conf.js'
+				}
+			}
+		},
+		bower: {
+			install: {
+				options: {
+					targetDir: './src/app/assets/vendor',
+					layout: 'byComponent',
+					install: true,
+					verbose: false,
+					cleanTargetDir: false,
+					cleanBowerDir: false,
+					bowerOptions: {}
+				}
+			}
+		},
+		less: {
+			endace: {
+				options: {
+					cleancss: true
+				},
+				files: {
+					'build/code/app/assets/styles/endace.css': [
+						'src/app/assets/styles/endace.less'
+					]
+				}
+			}
+		},
+		bower_concat: {
+			options: {
+				separator: ';'
+			},
+			third_party: {
+				dest: 'build/code/app/assets/scripts/vendor.js',
+				/*TODO: Investigate why order is important here */
+				include: [
+					'angular',
+					'angular-animate',
+					'spinjs',
+					'angular-bindonce',
+					'angular-bootstrap',
+					'underscore',
+					'angular-cookies',
+					'angular-messages',
+					'ng-sortable',
+					'd3',
+					'nvd3',
+					'angular-xeditable'
+				],
+				exclude: ['font-awesome', 'angular-mocks', 'highcharts-release']
+			}
+		}
+	});
+
+	// Load plugins
+	grunt.loadNpmTasks('grunt-bower-concat');
+	grunt.loadNpmTasks('grunt-wait');
+	grunt.loadNpmTasks('grunt-contrib-jshint');
+	grunt.loadNpmTasks('grunt-mkdir');
+	grunt.loadNpmTasks('grunt-rsync');
+	grunt.loadNpmTasks('grunt-ssh');
+	grunt.loadNpmTasks('grunt-shell');
+	grunt.loadNpmTasks('grunt-contrib-concat');
+	grunt.loadNpmTasks('grunt-contrib-uglify');
+	grunt.loadNpmTasks('grunt-git-rev-parse');
+	grunt.loadNpmTasks('grunt-karma');
+	grunt.loadNpmTasks('grunt-bower-task');
+	grunt.loadNpmTasks('grunt-contrib-less');
+	grunt.loadNpmTasks('grunt-angular-templates');
+
+	// Default task(s)
+	grunt.registerTask('default', []);
+
+	grunt.registerTask('deploy', 'Deploy application to docker', [
+		'build',
+		'shell:docker_clean',
+		'shell:docker_build',
+		'shell:docker_create_data_if_not_exists',
+		'shell:docker_get_osm_ip',
+		'shell:docker_get_docker_ip',
+		'shell:docker_run',
+		'shell:docker_status'
+	]);
+
+
+	grunt.registerTask('deploy-clean', 'Deploy application to docker and remove any persisting data', [
+		'shell:docker_clean_data',
+		'deploy'
+	]);
+
+	grunt.registerTask('deploy-stop', 'Stop application in docker', [
+		'shell:docker_stop'
+	]);
+
+	grunt.registerTask('deploy-remove', 'Remove docker image and container', [
+		'shell:docker_stop',
+		'shell:docker_remove'
+	]);
+
+	grunt.registerTask('deploy-status', 'Status of application in docker', [
+		'shell:docker_status'
+	]);
+
+	grunt.registerTask('deploy-logs', 'Follow web logs', [
+		'shell:docker_logs'
+	]);
+
+	// Build code
+	grunt.registerTask('build', 'Build code', function  () {
+		grunt.task.run(
+			'bower:install',
+			'shell:gulp_build'
+		);
+	});
+
+	// Build and copy code
+	grunt.registerTask('build-copy', 'Build code and copy into container', [
+		'build',
+		'shell:docker_copy_src'
+	]);
+
+	// Faster dev build for code
+	grunt.registerTask('dev-build', 'Build code - Development', [
+		'shell:gulp_build'
+	]);
+
+	// Faster dev build and copy code
+	grunt.registerTask('dev-build-copy', 'Build code and copy into container - Development', [
+		'dev-build',
+		'shell:docker_copy_src'
+	]);
+
+	// add a build settings file
+	grunt.registerTask('add-build-settings', ['git-rev-parse:short', 'shell:is_dirty', 'write-build-settings-file']);
+
+	// write out the build settings to file
+	grunt.registerTask('write-build-settings-file', function () {
+		var version,
+			settings,
+			githash,
+			dirty,
+			files,
+			includes;
+
+		// requires git-rev-parse:short to have been run
+		githash = grunt.config('githash');
+
+		// requires shell:is_dirty to have been run
+		dirty = grunt.config('dirty');
+
+		// use the version passed in if one exists
+		if (buildVersion) {
+			version = buildVersion;
+		} else {
+			version = [
+				'Dev',
+				grunt.template.today('yyyymmdd-HHMMss'),
+				githash
+			].join('.');
+			if (dirty) {
+				version += '.dirty';
+			}
+		}
+
+		// requires that githash config option has been set
+		settings = {
+			constants: {
+				'ENVIRONMENT': env,
+				'GIT_HASH': githash,
+				'CACHE_PARAMETER': new Date().getTime().toString(36),
+				'VERSION': version,
+				'URL_PREFIX': config.constants.URL_PREFIX ? config.constants.URL_PREFIX : ''
+			},
+			features: features,
+			buildDate: grunt.template.today()
+		};
+
+		grunt.file.write('build/code/build_settings.json', JSON.stringify(settings, null, '  '));
+
+		if (env === 'development') {
+			files = grunt.file.expand([
+				'src/app/assets/scripts/app.js',
+				'src/app/assets/scripts/services/*.js',
+				'src/app/assets/scripts/services/charts/*.js',
+				'src/app/assets/scripts/directives/*.js',
+				'src/app/assets/scripts/controllers/*.js',
+				'src/app/assets/scripts/filters/*.js',
+				'src/app/assets/vendor/bindonce/bindonce.min.js'
+			]);
+			files.unshift('src/app/assets/scripts/vendor.js');
+		} else {
+			files = ['src/app/assets/scripts/vendor.min.js', 'src/app/assets/scripts/endace.min.js'];
+		}
+
+		includes = _.chain(files)
+			.map(function (file) {
+				return file.replace('src/app/', config.constants.URL_PREFIX + '/');
+			})
+			.map(function (file) {
+				return file + '?_=' + settings.constants.CACHE_PARAMETER;
+			})
+			.map(function (file) {
+				return '<script src="' + file + '"></script>';
+			})
+			.reduce(function (str, script) {
+				return str + '\n' + script;
+			}, '')
+			.value();
+
+		grunt.file.write('build/code/app/assets/views/vision_includes.html', includes);
+	});
+
+	grunt.registerTask('provision-datasources', ['sshexec:provision_datasources']);
+
+	//run js unit tests
+	grunt.registerTask('test-js', ['karma:unit']);
+	grunt.registerTask('test-js-build', ['build', 'karma:build']);
+
+	//run e2e tests
+	grunt.registerTask('test-e2e', function() {
+		var done_update = this.async(),
+			tasks = ['shell:test_e2e_cleanup', 'shell:test_e2e_setup', 'shell:test_e2e', 'stop-selenium'],
+			fn = function () {
+				grunt.task.run.apply(grunt.task, tasks);
+				done_update();
+			},
+			manager;
+
+		if (grunt.option('no-send')) {
+			tasks[0] = 'wait';
+		} else {
+			//Selenium is not always up by the time protractor starts
+			//hence waiting a few seconds before launching protractor
+			tasks.unshift('wait');
+		}
+		if (grunt.option('no-selenium')) {
+			tasks.pop();
+			fn();
+			return;
+		}
+
+		//update selenium webdriver
+		grunt.util.spawn({
+			cmd: 'webdriver-manager',
+			args: ['update']
+		}, function () {
+			//starting selenium standalone in another process
+			manager = grunt.util.spawn({
+				cmd: 'webdriver-manager',
+				args: ['start'],
+			}, function () {
+				manager = null;
+			});
+
+			grunt.registerTask('stop-selenium', function () {
+				var done_stopping;
+				if (manager) {
+					done_stopping = this.async();
+					manager.on('exit', function () {
+						done_stopping();
+					});
+					//webdriver-manager closes selenium on receiving anything in stdin
+					manager.stdin.write('close it');
+				}
+			});
+
+			fn();
+		});
+
+	});
+	//start selenium
+	grunt.registerTask('start-selenium', ['shell:selenium_standalone']);
+
+	//run php tests
+	grunt.registerTask('test-php', ['shell:test_php']);
+
+	function buildKarmaOptions() {
+		var karmaConfFile = 'src/app/assets/test/config/karma.conf.js',
+			ret = {
+				configFile: karmaConfFile
+			},
+			opt = {
+				configFile: 'string',
+				files: 'array',
+				specs: 'array',
+				browsers: 'array',
+				browser: 'array',
+				singleRun: 'boolean',
+				runnerPort: 'number'
+			};
+		_.each(grunt.option.flags(), function (o) {
+			var arr = o.replace(/^\-\-(no\-)?/ig, '').split('='),
+				key = _.camelCase(arr[0]),
+				val = arr[1] || '';
+
+			if (o.match(/^\-\-no\-/)) {
+				val = false;
+			} else if (opt[key] === 'array') {
+				val = val.replace(' ', '').split(',');
+				if (key.match(/browser/)) {
+					key = 'browsers';
+				} else if (key.match(/(specs|files)/)) {
+					key = 'files';
+					require('./' + karmaConfFile)({
+						set: function (config) {
+							//extract files option
+							val = _.chain(config.files)
+								.filter(function (f) {
+									return !f.match(/test\/unit/);
+								})
+								.union(val)
+								.value();
+						}
+					});
+				}
+			} else if (opt[key] === 'boolean') {
+				val = true;
+			}
+			ret[key] = val;
+
+		});
+
+		return ret;
+	}
+
+	function buildPhpUnitOptions() {
+		var ret = buildCmdArgs({'log-junit': '/visionng/test_reports/' + path.basename(php_report_path)}, null, null, function (flag) {
+				return !flag.match(/(specs|files|probe|branch|name)=/);
+			});
+
+		ret += ' ' + (grunt.option('specs') || grunt.option('files') || '');
+
+		return ret;
+	}
+
+	function buildCmdArgs(options, prefix, infix, ignore) {
+		var ret = _.chain(grunt.option.flags())
+			.filter(ignore || function () {return true;})
+			.value()
+			.join(' ');
+		prefix = prefix || '--';
+		infix = infix || '=';
+		options = options || {};
+		_.each(options, function (def, opt) {
+			if (!grunt.option(opt)) {
+				ret += ' ' + prefix + opt + infix + def;
+			}
+		});
+		return ret;
+	}
+
+	function spawn(options) {
+		var defer = q.defer();
+		grunt.util.spawn(options, function (err, result, code) {
+			if (code) {
+				defer.reject({
+					result: result.stdout,
+					error: err || 'no error output',
+					code: code
+				});
+			}
+			defer.resolve(result);
+		});
+		return defer.promise;
+	}
+
+	// used by the shell:is_dirty task
+	function setDirty(err, stdout, stderr, cb) {
+		console.log(!!stdout);
+		grunt.config.set('dirty', !!stdout);
+		cb();
+	}
+};
